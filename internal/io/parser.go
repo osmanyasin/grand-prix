@@ -20,7 +20,7 @@ func ReadLevel[T any](filepath string) (*T, error) {
 	return &config, nil
 }
 
-func WriteSubmission(filepath string, strategy any) error {
+func WriteStrategy(filepath string, strategy any) error {
 	data, err := json.MarshalIndent(strategy, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal strategy: %w", err)

@@ -12,15 +12,16 @@ import (
 )
 
 func main() {
-	levelPath := flag.String("level", "", "Path to the level JSON file")
-	strategyPath := flag.String("strategy", "", "Path to the strategy JSON/txt file")
+	levelPath := flag.String("level", "", "Path to the level txt file")
+	strategyPath := flag.String("strategy", "", "Path to the strategy txt file")
 	levelNum := flag.Int("levelnum", 4, "The level number being evaluated (1-4)")
 	flag.Parse()
 
 	if *levelPath == "" || *strategyPath == "" {
-		log.Fatal("Both -level and -strategy flags are required.")
+		log.Fatal("Usage: go run ./cmd/evaluator -level <path> -strategy <path> -levelnum <num>")
 	}
 
+	// 1. Read Inputs
 	config, err := io.ReadLevel[models.LevelConfig](*levelPath)
 	if err != nil {
 		log.Fatalf("Failed to load level config: %v", err)
@@ -31,14 +32,17 @@ func main() {
 		log.Fatalf("Failed to load strategy: %v", err)
 	}
 
+	// 2. Run the Simulation
 	fmt.Println("Starting race simulation...")
 	finalState, err := simulator.EvaluateRace(config, strategy)
 	if err != nil {
 		log.Fatalf("Simulation failed: %v", err)
 	}
 
+	// 3. Calculate Scores
 	final, base, fuel, tyre := scoring.CalculateFinalScore(*levelNum, finalState, config)
 
+	// 4. Print the Results
 	fmt.Println("\n--- Race Results ---")
 	fmt.Printf("Total Time:          %.3f s\n", finalState.TotalTimeSeconds)
 	fmt.Printf("Total Fuel Used:     %.3f L\n", finalState.TotalFuelUsedLitres)
