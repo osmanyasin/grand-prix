@@ -7,24 +7,44 @@ import (
 	"github.com/osmanyasin/grand-prix/internal/physics"
 )
 
-// GenerateGreedyStrategy builds a segment-by-segment plan using state-aware calculations.
+type tyreSet struct {
+	id       int
+	compound string
+}
+
 func GenerateGreedyStrategy(config *models.LevelConfig) *models.Strategy {
-	// 1. Pick a starting tyre
-	initialTyreID := 1
-	compoundName := ""
-	if len(config.AvailableSets) > 0 {
-		initialTyreID = config.AvailableSets[0].IDs[0]
-		compoundName = config.AvailableSets[0].Compound
+	lapDistM := totalLapDistance(config.Track.Segments)
+	fuelPerLap := lapDistM * config.Car.FuelConsumption
+
+	var tyrePool []tyreSet
+	for _, s := range config.AvailableSets {
+		for _, id := range s.IDs {
+			tyrePool = append(tyrePool, tyreSet{id: id, compound: s.Compound})
+		}
 	}
+	usedSetIDs := make(map[int]bool)
+
+	pitLaps := planFuelStops(config, fuelPerLap)
+
+	openingWeather := "dry"
+	if len(config.Weather.Conditions) > 0 {
+		openingWeather = config.Weather.Conditions[0].Condition
+	}
+	startSet := pickBestCompound(config, openingWeather, tyrePool, usedSetIDs)
+	usedSetIDs[startSet.id] = true
 
 	strategy := &models.Strategy{
-		InitialTyreID: initialTyreID,
+		InitialTyreID: startSet.id,
 		Laps:          make([]models.Lap, config.Race.Laps),
 	}
 
-	projectedDegradation := 0.0
-	expectedSpeed := 0.0 // Track the car's state across segments
-	tyresUsedIndex := 0
+	activeCompound := startSet.compound
+	projectedDegrade := 0.0
+	expectedSpeed := 0.0
+	currentFuel := config.Car.InitialFuel
+	elapsedTime := 0.0
+
+	const degradeThreshold = 0.90
 
 	for l := 0; l < config.Race.Laps; l++ {
 		lap := models.Lap{
@@ -33,31 +53,30 @@ func GenerateGreedyStrategy(config *models.LevelConfig) *models.Strategy {
 			Pit:       models.PitAction{Enter: false},
 		}
 
+		currentWeather := getWeatherAtTime(config, elapsedTime)
+		props := config.Tyres.Properties[activeCompound]
+		frictionMulti, degradeRate := resolveModifiers(&props, currentWeather)
+
+		lapTime := 0.0
+
 		for i, seg := range config.Track.Segments {
 			action := models.SegmentAction{ID: seg.ID, Type: seg.Type}
-			props := config.Tyres.Properties[compoundName]
 
 			if seg.Type == "straight" {
 				action.TargetMPS = config.Car.MaxSpeedMPS
 
-				// Look ahead to check if the next segment is a corner
 				nextSegIndex := (i + 1) % len(config.Track.Segments)
 				nextSeg := config.Track.Segments[nextSegIndex]
 
 				if nextSeg.Type == "corner" {
-					// 1. Calculate Safe Corner Entry Speed
-					currentFriction := physics.CalculateTyreFriction(props.BaseFriction, projectedDegradation, props.DryFrictionMulti)
-					maxSafeSpeed := physics.CalculateMaxCornerSpeed(currentFriction, nextSeg.RadiusM) * 0.85
+					currentFriction := physics.CalculateTyreFriction(props.BaseFriction, projectedDegrade, frictionMulti)
+					maxSafeSpeed := physics.CalculateMaxCornerSpeed(currentFriction, nextSeg.RadiusM, config.Car.CrawlConstantMPS)
 
-					// 2. Calculate Peak Speed on this straight
-					// v_f = sqrt(v_i^2 + 2ad)
-					peakSpeed := math.Sqrt(math.Max(0, math.Pow(expectedSpeed, 2)+2*config.Car.AccelMPS2*seg.LengthM))
+					peakSpeed := math.Sqrt(math.Max(0, expectedSpeed*expectedSpeed+2*config.Car.AccelMPS2*seg.LengthM))
 					peakSpeed = math.Min(peakSpeed, config.Car.MaxSpeedMPS)
 
-					// 3. Determine if braking is required
 					if peakSpeed > maxSafeSpeed {
-						// d = (v_final^2 - v_initial^2) / (2 * a)
-						brakeDist := (math.Pow(maxSafeSpeed, 2) - math.Pow(peakSpeed, 2)) / (2 * -config.Car.BrakeMPS2)
+						brakeDist := (peakSpeed*peakSpeed - maxSafeSpeed*maxSafeSpeed) / (2 * config.Car.BrakeMPS2)
 						action.BrakeStartMBeforeNext = math.Min(math.Max(brakeDist, 0), seg.LengthM)
 						expectedSpeed = maxSafeSpeed
 					} else {
@@ -68,29 +87,157 @@ func GenerateGreedyStrategy(config *models.LevelConfig) *models.Strategy {
 					expectedSpeed = config.Car.MaxSpeedMPS
 				}
 
-				projectedDegradation += physics.DegradationStraight(props.DryDegradation, seg.LengthM)
+				projectedDegrade += physics.DegradationStraight(degradeRate, seg.LengthM)
+				lapTime += seg.LengthM / math.Max(expectedSpeed, 1)
 			} else if seg.Type == "corner" {
-				// We assume we exit the corner at the same speed we entered
 				action.TargetMPS = expectedSpeed
-				projectedDegradation += physics.DegradationCorner(expectedSpeed, seg.RadiusM, props.DryDegradation)
+				projectedDegrade += physics.DegradationCorner(expectedSpeed, seg.RadiusM, degradeRate)
+				lapTime += seg.LengthM / math.Max(expectedSpeed, 1)
 			}
 
 			lap.Segments = append(lap.Segments, action)
 		}
 
-		// Pit Stop Logic
-		if projectedDegradation > 0.70 {
+		elapsedTime += lapTime
+		currentFuel -= fuelPerLap
+
+		needsTyreChange := projectedDegrade >= degradeThreshold
+		needsFuelStop := isFuelPitLap(pitLaps, l+1)
+
+		if needsTyreChange || needsFuelStop {
 			lap.Pit.Enter = true
-			tyresUsedIndex++
-			if tyresUsedIndex < len(config.AvailableSets[0].IDs) {
-				lap.Pit.TyreChangeSetID = config.AvailableSets[0].IDs[tyresUsedIndex]
+			nextWeather := getWeatherAtTime(config, elapsedTime)
+			nextSet := pickBestCompound(config, nextWeather, tyrePool, usedSetIDs)
+			if nextSet.id != 0 {
+				usedSetIDs[nextSet.id] = true
+				lap.Pit.TyreChangeSetID = nextSet.id
+				activeCompound = nextSet.compound
+				projectedDegrade = 0.0
 			}
-			lap.Pit.FuelRefuelAmountL = 50.0
-			projectedDegradation = 0.0
+
+			if needsFuelStop || currentFuel < fuelPerLap*3 {
+				lapsRemaining := config.Race.Laps - (l + 1)
+				nextStop := nextFuelStop(pitLaps, l+1)
+				lapsToNextStop := lapsRemaining
+				if nextStop > 0 {
+					lapsToNextStop = nextStop - (l + 1)
+				}
+				fuelNeeded := float64(lapsToNextStop)*fuelPerLap + fuelPerLap*2
+				refuelAmount := fuelNeeded - currentFuel
+				refuelAmount = math.Max(0, refuelAmount)
+				refuelAmount = math.Min(refuelAmount, config.Car.FuelTankCapacity-currentFuel)
+				if refuelAmount > 0 {
+					lap.Pit.FuelRefuelAmountL = refuelAmount
+					currentFuel += refuelAmount
+				}
+			}
 		}
 
 		strategy.Laps[l] = lap
 	}
 
 	return strategy
+}
+
+func totalLapDistance(segments []models.Segment) float64 {
+	total := 0.0
+	for _, s := range segments {
+		total += s.LengthM
+	}
+	return total
+}
+
+func planFuelStops(config *models.LevelConfig, fuelPerLap float64) []int {
+	var stops []int
+	fuel := config.Car.InitialFuel
+	lap := 0
+	totalLaps := config.Race.Laps
+
+	for lap < totalLaps {
+		lapsLeft := int(fuel / fuelPerLap)
+		if lap+lapsLeft >= totalLaps {
+			break
+		}
+		stopLap := lap + intMax(1, lapsLeft-2)
+		stops = append(stops, stopLap)
+		fuelAtStop := fuel - float64(stopLap-lap)*fuelPerLap
+		fuel = fuelAtStop + (config.Car.FuelTankCapacity - fuelAtStop)
+		lap = stopLap
+	}
+	return stops
+}
+
+func isFuelPitLap(pitLaps []int, lap int) bool {
+	for _, p := range pitLaps {
+		if p == lap {
+			return true
+		}
+	}
+	return false
+}
+
+func nextFuelStop(pitLaps []int, afterLap int) int {
+	for _, p := range pitLaps {
+		if p > afterLap {
+			return p
+		}
+	}
+	return 0
+}
+
+func pickBestCompound(config *models.LevelConfig, weather string, pool []tyreSet, used map[int]bool) tyreSet {
+	best := tyreSet{}
+	bestScore := -math.MaxFloat64
+
+	for _, ts := range pool {
+		if used[ts.id] {
+			continue
+		}
+		props, ok := config.Tyres.Properties[ts.compound]
+		if !ok {
+			continue
+		}
+		frictionMulti, degradeRate := resolveModifiers(&props, weather)
+		score := (props.BaseFriction * frictionMulti) / math.Max(degradeRate, 0.001)
+		if score > bestScore {
+			bestScore = score
+			best = ts
+		}
+	}
+
+	return best
+}
+
+func getWeatherAtTime(config *models.LevelConfig, t float64) string {
+	if len(config.Weather.Conditions) == 0 {
+		return "dry"
+	}
+	elapsed := 0.0
+	for _, w := range config.Weather.Conditions {
+		elapsed += w.DurationS
+		if t < elapsed {
+			return w.Condition
+		}
+	}
+	return config.Weather.Conditions[len(config.Weather.Conditions)-1].Condition
+}
+
+func resolveModifiers(props *models.TyreProperty, weather string) (float64, float64) {
+	switch weather {
+	case "cold":
+		return props.ColdFrictionMulti, props.ColdDegradation
+	case "light_rain":
+		return props.LightRainFrictionMulti, props.LightRainDegradation
+	case "heavy_rain":
+		return props.HeavyRainFrictionMulti, props.HeavyRainDegradation
+	default:
+		return props.DryFrictionMulti, props.DryDegradation
+	}
+}
+
+func intMax(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

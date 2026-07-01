@@ -35,6 +35,13 @@ func main() {
 	// 2. Run the Simulation
 	fmt.Println("Starting race simulation...")
 	finalState, err := simulator.EvaluateRace(config, strategy)
+	fmt.Println("\n--- Pit Stop Log ---")
+	for i, lap := range strategy.Laps {
+		if lap.Pit.Enter {
+			fmt.Printf("  Lap %d: tyre_id=%d refuel=%.1fL\n",
+				i+1, lap.Pit.TyreChangeSetID, lap.Pit.FuelRefuelAmountL)
+		}
+	}
 	if err != nil {
 		log.Fatalf("Simulation failed: %v", err)
 	}

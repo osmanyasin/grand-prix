@@ -16,8 +16,8 @@ func CalculateTyreFriction(baseFriction, totalDegradation, weatherMultiplier flo
 	return (baseFriction - totalDegradation) * weatherMultiplier
 }
 
-func CalculateMaxCornerSpeed(tyreFriction, radius float64) float64 {
-	return math.Sqrt(tyreFriction * Gravity * radius)
+func CalculateMaxCornerSpeed(tyreFriction, radius, crawlConstant float64) float64 {
+	return math.Sqrt(tyreFriction*Gravity*radius) + crawlConstant
 }
 
 func DegradationStraight(degradationRate, length float64) float64 {

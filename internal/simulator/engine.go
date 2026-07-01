@@ -27,9 +27,13 @@ func EvaluateRace(config *models.LevelConfig, strategy *models.Strategy) (*CarSt
 				processLimpMode(state, trackSeg, config)
 			} else {
 				if trackSeg.Type == "straight" {
-					processStraight(state, action, trackSeg, config)
+					if err := processStraight(state, action, trackSeg, config); err != nil {
+						return nil, err
+					}
 				} else if trackSeg.Type == "corner" {
-					processCorner(state, trackSeg, config)
+					if err := processCorner(state, trackSeg, config); err != nil {
+						return nil, err
+					}
 				}
 			}
 
@@ -46,6 +50,7 @@ func EvaluateRace(config *models.LevelConfig, strategy *models.Strategy) (*CarSt
 
 func processStraight(state *CarState, action models.SegmentAction, seg models.Segment, config *models.LevelConfig) error {
 	state.IsCrawlMode = false
+
 	weather := getCurrentWeather(config, state.TotalTimeSeconds)
 	tyreProps, err := getActiveTyreProperties(config, state.ActiveTyreID)
 	if err != nil {
@@ -117,6 +122,9 @@ func processCorner(state *CarState, seg models.Segment, config *models.LevelConf
 	if state.IsCrawlMode {
 		state.CurrentSpeedMPS = config.Car.CrawlConstantMPS
 		state.TotalTimeSeconds += seg.LengthM / config.Car.CrawlConstantMPS
+		cornerFuel := physics.FuelUsed(config.Car.CrawlConstantMPS, config.Car.CrawlConstantMPS, seg.LengthM)
+		state.CurrentFuelLitres -= cornerFuel
+		state.TotalFuelUsedLitres += cornerFuel
 		return nil
 	}
 
@@ -128,7 +136,7 @@ func processCorner(state *CarState, seg models.Segment, config *models.LevelConf
 	frictionMulti, degradeRate := resolveTyreModifiers(tyreProps, weather.Condition)
 
 	currentFriction := physics.CalculateTyreFriction(tyreProps.BaseFriction, state.ActiveTyreDegrad, frictionMulti)
-	maxSafeSpeed := physics.CalculateMaxCornerSpeed(currentFriction, seg.RadiusM)
+	maxSafeSpeed := physics.CalculateMaxCornerSpeed(currentFriction, seg.RadiusM, config.Car.CrawlConstantMPS)
 
 	if state.CurrentSpeedMPS > maxSafeSpeed {
 		state.TotalTimeSeconds += config.Race.CornerCrashPenalty
@@ -153,6 +161,9 @@ func processCorner(state *CarState, seg models.Segment, config *models.LevelConf
 func processLimpMode(state *CarState, seg models.Segment, config *models.LevelConfig) {
 	state.CurrentSpeedMPS = config.Car.LimpConstantMPS
 	state.TotalTimeSeconds += seg.LengthM / config.Car.LimpConstantMPS
+	limpFuel := physics.FuelUsed(config.Car.LimpConstantMPS, config.Car.LimpConstantMPS, seg.LengthM)
+	state.CurrentFuelLitres -= limpFuel
+	state.TotalFuelUsedLitres += limpFuel
 }
 
 func processPitStop(state *CarState, pit models.PitAction, config *models.LevelConfig) {
@@ -171,7 +182,6 @@ func processPitStop(state *CarState, pit models.PitAction, config *models.LevelC
 	}
 
 	state.TotalTimeSeconds += pitTime
-
 	state.CurrentSpeedMPS = config.Race.PitExitSpeedMPS
 	state.IsLimpMode = false
 	state.IsCrawlMode = false
@@ -181,11 +191,15 @@ func checkFailureModes(state *CarState) {
 	if state.CurrentFuelLitres <= 0.0 {
 		state.CurrentFuelLitres = 0.0
 		state.IsLimpMode = true
+		fmt.Printf("  [LIMP] Fuel empty at t=%.1fs\n", state.TotalTimeSeconds)
 	}
 
-	if state.ActiveTyreDegrad >= 1.0 {
+	if state.ActiveTyreDegrad >= 1.0 && !state.IsLimpMode {
 		state.NumberOfBlowouts++
+		state.ActiveTyreDegrad = 1.0
 		state.IsLimpMode = true
+		fmt.Printf("  [BLOWOUT #%d] Tyre id=%d at t=%.1fs degrad=%.3f\n",
+			state.NumberOfBlowouts, state.ActiveTyreID, state.TotalTimeSeconds, state.ActiveTyreDegrad)
 	}
 }
 
@@ -194,22 +208,15 @@ func getCurrentWeather(config *models.LevelConfig, currentTime float64) models.W
 		return models.WeatherCondition{Condition: "dry", AccelerationMulti: 1.0, DecelerationMulti: 1.0}
 	}
 
-	totalCycleTime := 0.0
+	elapsed := 0.0
 	for _, w := range config.Weather.Conditions {
-		totalCycleTime += w.DurationS
-	}
-
-	modTime := math.Mod(currentTime, totalCycleTime)
-
-	accumulatedTime := 0.0
-	for _, w := range config.Weather.Conditions {
-		accumulatedTime += w.DurationS
-		if modTime <= accumulatedTime {
+		elapsed += w.DurationS
+		if currentTime < elapsed {
 			return w
 		}
 	}
 
-	return config.Weather.Conditions[0]
+	return config.Weather.Conditions[len(config.Weather.Conditions)-1]
 }
 
 func getActiveTyreProperties(config *models.LevelConfig, tyreID int) (*models.TyreProperty, error) {

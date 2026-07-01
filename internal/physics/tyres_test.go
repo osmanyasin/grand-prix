@@ -24,8 +24,9 @@ func TestCalculateMaxCornerSpeed(t *testing.T) {
 	tyreFriction := 0.9
 	radius := 50.0
 	expected := 21.0
+	crawlConstant := 10.0
 
-	got := physics.CalculateMaxCornerSpeed(tyreFriction, radius)
+	got := physics.CalculateMaxCornerSpeed(tyreFriction, radius, crawlConstant)
 
 	if math.Abs(got-expected) > 1e-9 {
 		t.Errorf("CalculateMaxCornerSpeed() = %v; want %v", got, expected)
